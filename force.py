@@ -1,4 +1,4 @@
-
+import main
 
 def pressure(list, p, i):
     Fx, Fy, Fz = 0, 0, 0
