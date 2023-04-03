@@ -1,5 +1,12 @@
 import numpy as np
 
+
+def create_space():
+    x_bound = [0, 0]
+    y_bound = [0, 0]
+    z_bound = [0, 0]
+    return x_bound, y_bound, z_bound
+
 def create():
     num_points = 100
     spacing = 1.0
