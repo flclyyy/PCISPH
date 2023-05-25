@@ -6,17 +6,19 @@ import math
 
 # global constant
 dimension = 2
-numPreLine = 40
+numPreLine = 30
 numPar = numPreLine ** dimension
 d = 0.2
-kernelRadius = 2 * d
+kernelRadius: float = 2 * d
 density0 = 1 / d ** dimension
+Err = 0.02 * density0
 mass = 1.0
 boundX = 15.0
 boundY = 15.0
 boundZ = 15.0
 restiCoeff = 0.8
 rest = 0.9
+g = 100
 # fricCoeff = 0.1
 EosCoeff = 200.0
 EosExponent = 7.0
@@ -29,21 +31,36 @@ numCellX = ti.ceil(boundX/cellSize)
 numCellY = ti.ceil(boundY/cellSize)
 #numCellZ = ti.ceil(boundZ/cellSize)
 numCell = numCellX * numCellY #* numCellZ
+last = 88
 
 ti.init(arch=ti.gpu)
 
 # physical fields
 position = ti.Vector.field(dimension, float, shape=numTotal)
-velocity = ti.Vector.field(dimension, float, shape=numPar)
+velocity = ti.Vector.field(dimension, float, shape=numTotal)
 density = ti.field(float, shape=numTotal)
-pressure = ti.field(float, shape=numPar)
+densityErr = ti.field(float, shape=numTotal)
+pressure = ti.field(float, shape=numTotal)
 acceleration = ti.Vector.field(dimension, float, shape=numPar)
 pressureGradientForce = ti.Vector.field(dimension, float, shape=numPar)
-viscosityForce = ti.Vector.field(dimension, float, shape=numPar)
+viscosityForce = ti.Vector.field(dimension, float, shape=numTotal)
+
 
 
 # neighbor search variables
-maxNumNeighbors = 1000
+maxNumNeighbors = 100
+
+viscosity_debug = ti.Vector.field(dimension, float, shape=10)
+debug_index = ti.field(int, shape=10)
+debug_density = ti.field(float, shape=10)
+debug_vxy = ti.field(float, shape=10)
+debug_cubic = ti.Vector.field(dimension, float, shape=10)
+debug_r = ti.Vector.field(dimension, float, shape=10)
+debug_dv = ti.Vector.field(dimension, float, shape=10)
+debug_v1 = ti.Vector.field(dimension,float, shape=1)
+debug_v2 = ti.Vector.field(dimension,float, shape=10)
+
+
 maxNumParInCell = 1000
 
 numParInCell = ti.field(int, shape=numCell)
@@ -113,13 +130,13 @@ def IsInBound(c):
 
 @ti.kernel
 def neighborSearch():
-    for par in range(numPar):
+    for par in range(numTotal):
         cell = getCell(position[par])
         k = ti.atomic_add(numParInCell[cell], 1)
         cell2Par[cell, k] = par
         #print((k))
 
-    for i in range(numPar):
+    for i in range(numTotal):
         cell = getCell(position[i])
         kk = 0
         '''
@@ -157,7 +174,7 @@ def neighborSearch():
 # physical compute
 @ti.kernel
 def computeDensity():
-    for i in range(numPar):
+    for i in range(numTotal):
         for k in range(numNeighbor[i]):
             j = neighbor[i, k]
             r = (position[i] - position[j]).norm()
@@ -166,25 +183,61 @@ def computeDensity():
         if density[i] < density0:
             density[i] = density0
 
-    for i in range(numStatic):
-        density[i+numPar] = density0
+
+@ti.kernel
+def computeErrDensity():
+    for i in range(numTotal):
+        densityErr[i] = density[i] - density0
+
+
 
 @ti.kernel
 def computeViscosityForce():
     for i in viscosityForce:
         for k in range(numNeighbor[i]):
             j = neighbor[i, k]
-            r = position[i] - position[j]
-            v_xy = (velocity[i] - velocity[j]).dot(r)
-            viscosityForce[i] += 2 * (2 + dimension) * mu * d**dimension * (mass / density[j]) * v_xy / (r.norm()**2 + 0.01 * kernelRadius**2) * cubic_kernel_derivative(r)
+            r = (position[i] - position[j])
+            v1 = velocity[i]
+            v2 = velocity[j]
+            dv = v1 - v2
+            v_xy = dv.dot(r)
+            temp = 2 * (2 + dimension) * mu * d**dimension * (mass / density[j]) * v_xy / (r.norm()**2 + 0.01 * kernelRadius**2) * cubic_kernel_derivative(r)
+            if i == last:
+                viscosity_debug[k] = temp
+                debug_index[k] = j
+                debug_density[k] = density[j]
+                debug_r[k] = r
+                debug_v1[0] = v1
+                debug_v2[k] = v2
+                debug_dv[k] = dv
+                debug_vxy[k] = v_xy
+                debug_cubic[k] = cubic_kernel_derivative(r)
 
+            viscosityForce[i] += temp
 
 @ti.kernel
 def computePressure():
     for i in pressure:
         pressure[i] = EosCoeff*((density[i]/density0) ** EosExponent - 1.0)
 
+t = ti.field(float, shape=numPar)
+t.fill(0.0)
 
+@ti.kernel
+def computePCIPressure():
+    temp1 = ti.Vector([0.0 for _ in range(dimension)])
+
+    for i in range(numPar):
+
+        for j in range(numNeighbor[i]):
+            r = position[i] - position[j]
+            res = cubic_kernel_derivative(r)
+            temp1 += res
+            t[i] += res.dot(res)
+
+        beta = dt ** 2 * mass ** 2 * 2 / density0 ** 2
+        pressure[i] += -densityErr[i] / (-temp1.dot(temp1) - t[i]) / beta
+        print(t[i])
 @ti.kernel
 def computePressGradientForce():
     for i in pressureGradientForce:
@@ -198,7 +251,7 @@ def computePressGradientForce():
 @ti.kernel
 def computeAcceleration():
     for i in acceleration:
-        gravity = ti.Vector([0, -100])
+        gravity = ti.Vector([0, -g])
         acceleration[i] += gravity + viscosityForce[i]/mass + pressureGradientForce[i]/mass
 
 
@@ -207,7 +260,6 @@ def advanceTime():
     for i in range(numPar):
         velocity[i] += acceleration[i] * dt
         position[i] += velocity[i] * dt
-
 
 @ti.kernel
 def boundaryCollision():
@@ -244,7 +296,7 @@ def boundaryCollision():
 
 @ti.func
 def simualteCollisions(i, vec, l):
-    c_f = 0.5
+    c_f = 0.4
     position[i] += vec * l
     velocity[i] -= (1.0 + c_f) * velocity[i].dot(vec) * vec
 
@@ -266,6 +318,8 @@ def enforceBoundary():
 def clear():
     # clear the density
     density.fill(0.0)
+    densityErr.fill(0.0)
+    pressure.fill(0.0)
 
     # clear the forces and acceleration
     acceleration.fill(0.0)
@@ -284,30 +338,49 @@ def step():
     clear()
     neighborSearch()
     computeDensity()
-    #print("Density", density[500])
     computeViscosityForce()
-    #print("Vis", viscosityForce[500][0],viscosityForce[500][1],viscosityForce[500][2])
     computePressure()
-    #print("Pre", pressure[500])
     computePressGradientForce()
-    #print("PreForce", pressureGradientForce[500][0], pressureGradientForce[500][1], pressureGradientForce[500][2])
     computeAcceleration()
-    #print("Ac",acceleration[500][0],acceleration[500][1],acceleration[500][2])
     advanceTime()
     #boundaryCollision()
     enforceBoundary()
+
+
+@ti.kernel
+def whileCheck(k: ti.int32) -> bool:
+    maxErr = 0
+    for i in range(numTotal):
+        if(densityErr[i] > maxErr):
+            maxErr = densityErr[i]
+    return maxErr > Err or k < 3
+
+def PCIstep():
+
+    clear()
+    neighborSearch()
+    computeViscosityForce()
+    k = 0
+    while whileCheck(k):
+        advanceTime()
+        computeDensity()
+        computePCIPressure()
+        computePressGradientForce()
+        k += 1
+    computeAcceleration()
+    advanceTime()
+
 
 
 
 def initialization():
     for i in range(numPar):
         position[i] = [
-            i % numPreLine * d + 4*d,
-            (i // numPreLine) * d + 4*d,
+            i % numPreLine * d + 20*d,
+            (i // numPreLine) * d +10*d,
             #i // (numPreLine ** 2) * d
         ]
         #print(position[i][0], position[i][1])
-
     k = 0
     # num = 3 * (boundX / d + 1)
     for i in range(3):
@@ -318,7 +391,7 @@ def initialization():
             position[index] = [x, y]
             x += d
             k += 1
-
+    print(k/3)
     # 3*(boundY/d - 5)
     for i in range(3):
         x = d * i
@@ -349,12 +422,16 @@ def initialization():
             x += d
             k += 1
 
+    for i in range(numStatic):
+        velocity[i+numPar][0] = 0
+        velocity[i + numPar][1] = 0
 
 
 def draw(gui):
+
     pos = position.to_numpy()
-    #pos[:, 0] *= 1.0 / boundX
-    #pos[:, 1] *= 1.0 / boundY
+    pos[:, 0] *= 1.0 / boundX
+    pos[:, 1] *= 1.0 / boundY
     pos1 = np.zeros((numPar, 2))
     for i in range(numPar):
         pos1[i][0] = position[i][0] * 1.0 / boundX
@@ -374,14 +451,50 @@ def draw(gui):
                 )
 
     # highlight particle 0 with red
+    pos_last = np.zeros((1, 2))
+    pos_last[0][0] = position[last][0] * 1.0 / boundX
+    pos_last[0][1] = position[last][1] * 1.0 / boundY
+    gui.circles(pos_last,
+                radius=3.0,
+                color=0xff0000
+                )
 
+    nei = neighbor.to_numpy()
+    for i in range(numNeighbor[last]):
+        pos_neighbor = np.zeros((1, 2))
+        pos_neighbor[0][0] = pos[nei[last][i]][0]
+        pos_neighbor[0][1] = pos[nei[last][i]][1]
+        gui.circles(pos_neighbor,
+                    radius=3.0,
+                    color=0x00ff00
+                    )
     gui.text(
         content=f'press space to pause',
         pos=(0, 0.99),
         color=0x0)
 
-    gui.text(content="position[0]={}".format(position[0]),
+    gui.text(content="position[last]={}".format(position[last]),
              pos=(0, 0.95),
+             color=0x0)
+
+    gui.text(content="pressure force[last]={}".format(pressureGradientForce[last]),
+             pos=(0, 0.91),
+             color=0x0)
+
+    gui.text(content="viscosity force[last]={}".format(viscosityForce[last]),
+             pos=(0, 0.87),
+             color=0x0)
+
+    gui.text(content="numNeighbor[last]={}".format(numNeighbor[last]),
+             pos=(0, 0.83),
+             color=0x0)
+
+    gui.text(content="density[last]={}".format(density[last]),
+             pos=(0, 0.79),
+             color=0x0)
+
+    gui.text(content="velocity[last]={}".format(velocity[last]),
+             pos=(0, 0.76),
              color=0x0)
 
 
@@ -390,11 +503,23 @@ def run():
                 background_color=0x112F41,
                 res=(500, 500)
                  )
+
     while True:
-        step()
+
         draw(gui)
         gui.show()
-
+        step()
+        #print(viscosity_debug)
+        #print(debug_index)
+        #print(debug_density)
+        #print(debug_r)
+        #print(debug_v1)
+        #print(debug_v2)
+        #print(debug_dv)
+        #print(debug_vxy)
+        #print(numNeighbor[last])
+        #print(debug_cubic)
+        #print("\n")
 
 initialization()
 #print(position[numPar + 100])
